@@ -9,17 +9,16 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
     ContextTypes,
     PollAnswerHandler,
 )
 
 # =========================
-# Config
+# Config (UPDATED)
 # =========================
 BOT_TOKEN = "8183120153:AAF3k3FZViX33glskyf-CTi2F3LoxulGvV0"
-CHAT_ID = -5299275232
-API_URL = "https://uat.dmz.finance/stores/tdd/qcdt/new_price"
+CHAT_ID = -4680966417
+API_URL = "https://www.dmz.finance/stores/tdd/qcdt/new_price"
 
 TZ = ZoneInfo("Asia/Singapore")
 
