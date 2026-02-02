@@ -1,288 +1,252 @@
 import asyncio
-from datetime import datetime, date
-from zoneinfo import ZoneInfo
-import httpx
 import json
+import logging
+from datetime import datetime, time as dtime, timedelta
+from zoneinfo import ZoneInfo
 
-# ================= CONFIG =================
+import requests
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-TOKEN = "8591711650:AAHYMbGwiYxCqZm64tKyWiOgl2moiRUvVWM"
-CHAT_ID = -4680966417
+# =========================
+# Hardcoded config (as requested)
+# =========================
+BOT_TOKEN = "8183120153:AAF3k3FZViX33glskyf-CTi2F3LoxulGvV0"
+CHAT_ID = -5299275232
 
+API_URL = "https://uat.dmz.finance/stores/tdd/qcdt/new_price"
+
+# Schedule: Weekdays only, 3:30pm–8:30pm SGT, check every 30 min
 TZ = ZoneInfo("Asia/Singapore")
-BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
+WINDOW_START = dtime(15, 30)  # 3:30 PM
+WINDOW_END = dtime(20, 30)    # 8:30 PM
+POLL_INTERVAL_SECONDS = 30 * 60  # 30 minutes
 
-DAILY_REMINDER = "📝 Ascent, please remember to update QCDT price on the portal."
+# Mentions & template
+CC_LINE = "CC: @Nathan_DMZ @LEEKAIYANG @Duke_RWAlpha @AscentHamza"
 
-# Who to nag until they click
-TARGET_USERNAME = "mrpotato1234"       # without @
-TARGET_MENTION = "@mrpotato1234"
+# Requests
+HTTP_TIMEOUT_SECONDS = 15
 
-# Reminder cadence after check-in is posted
-NAG_EVERY_MINUTES = 15
-NAG_START_HOUR = 18      # 6:00 PM
-NAG_START_MIN = 0
-NAG_END_HOUR = 21        # 9:00 PM cutoff (adjust if you want)
-NAG_END_MIN = 0
+# Error alert cooldown (avoid spam if API is down)
+ERROR_COOLDOWN = timedelta(minutes=60)
 
-HOLIDAY_API_BASE = "https://date.nager.at/api/v3/PublicHolidays"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
-# ================= TELEGRAM HELPERS =================
+# In-memory state (no persistence as requested)
+state = {
+    "last_seen_update_time": None,   # str
+    "alerted_date": None,            # YYYY-MM-DD (SGT) we already alerted for
+    "last_error_alert_at": None      # datetime
+}
 
-async def tg_post(method: str, payload: dict, timeout: int = 20):
-    url = f"{BASE_URL}/{method}"
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.post(url, json=payload, timeout=timeout)
-            print(f"TG {method}: {r.status_code} {r.text[:300]}")
-            return r
-        except Exception as e:
-            print(f"TG {method} EXCEPTION: {type(e).__name__}: {e}")
-            return None
+def now_sgt() -> datetime:
+    return datetime.now(TZ)
 
-async def tg_get(method: str, params: dict, timeout: int = 20):
-    url = f"{BASE_URL}/{method}"
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get(url, params=params, timeout=timeout)
-            print(f"TG {method}: {r.status_code} {r.text[:200]}")
-            return r
-        except Exception as e:
-            print(f"TG {method} EXCEPTION: {type(e).__name__}: {e}")
-            return None
+def is_weekday(dt: datetime) -> bool:
+    return dt.weekday() < 5  # Mon=0 ... Fri=4
 
-async def send_text(text: str):
-    await tg_post("sendMessage", {"chat_id": CHAT_ID, "text": text}, timeout=10)
+def in_window(dt: datetime) -> bool:
+    t = dt.time()
+    return (t >= WINDOW_START) and (t <= WINDOW_END)
 
-async def pin_message(message_id: int):
-    await tg_post(
-        "pinChatMessage",
-        {"chat_id": CHAT_ID, "message_id": message_id, "disable_notification": True},
-        timeout=10,
+def parse_update_time_sgt(s: str) -> datetime:
+    # API format: "2026-01-22 17:29:35"
+    return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+
+def fmt_price_date(price_date_str: str) -> str:
+    # "2026-01-21" -> "21 Jan 2026"
+    d = datetime.strptime(price_date_str, "%Y-%m-%d").date()
+    return d.strftime("%d %b %Y")
+
+def should_send_error_alert(dt: datetime) -> bool:
+    last = state["last_error_alert_at"]
+    if last is None:
+        return True
+    return (dt - last) >= ERROR_COOLDOWN
+
+def fetch_payload_sync() -> dict:
+    r = requests.get(API_URL, timeout=HTTP_TIMEOUT_SECONDS)
+    r.raise_for_status()
+    return r.json()
+
+async def fetch_payload() -> dict:
+    # Run blocking requests in a thread to avoid blocking the asyncio loop
+    return await asyncio.to_thread(fetch_payload_sync)
+
+def build_alert_message(payload: dict) -> str:
+    data = payload.get("data", {})
+    price_date = data.get("price_date", "")
+    price = data.get("price", "")
+
+    try:
+        price_date_pretty = fmt_price_date(price_date)
+    except Exception:
+        price_date_pretty = price_date
+
+    # Message exactly in your requested structure
+    return (
+        f"<pre>{json.dumps(payload, ensure_ascii=False)}</pre>\n\n"
+        f"Updated today for {price_date_pretty} price. Price of {price} tallies with NAV report.\n\n"
+        f"{CC_LINE}"
     )
 
-async def send_checkin_and_pin():
+def build_status_message(payload: dict) -> str:
+    dt = now_sgt()
+    today_str = dt.strftime("%Y-%m-%d")
+    return (
+        f"<b>Status</b>\n"
+        f"Time (SGT): {dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Today: {today_str}\n"
+        f"In window: {in_window(dt)} | Weekday: {is_weekday(dt)}\n"
+        f"Last seen update_time: {state['last_seen_update_time']}\n"
+        f"Alerted date: {state['alerted_date']}\n\n"
+        f"<b>Current API payload</b>\n"
+        f"<pre>{json.dumps(payload, ensure_ascii=False)}</pre>"
+    )
+
+async def send_error(context: ContextTypes.DEFAULT_TYPE, err_text: str) -> None:
+    msg = (
+        "⚠️ QCDT price monitor error while checking API:\n"
+        f"<pre>{err_text}</pre>\n\n"
+        f"Endpoint: {API_URL}"
+    )
+    await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.HTML)
+
+async def send_alert(context: ContextTypes.DEFAULT_TYPE, payload: dict) -> None:
+    await context.bot.send_message(
+        chat_id=CHAT_ID,
+        text=build_alert_message(payload),
+        parse_mode=ParseMode.HTML
+    )
+
+    # Acknowledgement poll
+    await context.bot.send_poll(
+        chat_id=CHAT_ID,
+        question="Acknowledge QCDT price update?",
+        options=["✅ Acknowledge"],
+        is_anonymous=False
+    )
+
+async def check_logic(context: ContextTypes.DEFAULT_TYPE, forced: bool = False) -> dict | None:
     """
-    Sends a message with inline buttons (trackable per user), then pins it.
-    Returns message_id if successful else None.
+    If forced=True: always attempt one fetch and return payload (or None on failure).
+    If forced=False: only checks during weekday + window and stops for the day after alert.
     """
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": "Has QCDT price been updated on portal?",
-        "reply_markup": {
-            "inline_keyboard": [
-                [{"text": "✅ Yes", "callback_data": "QCDT_YES"},
-                 {"text": "❌ No", "callback_data": "QCDT_NO"}],
-                [{"text": "🏖️ NA - SG/UAE public holiday", "callback_data": "QCDT_NA"}],
-            ]
-        }
-    }
-    r = await tg_post("sendMessage", payload, timeout=10)
-    if not r:
+    dt = now_sgt()
+    today_str = dt.strftime("%Y-%m-%d")
+
+    # Daily reset if date changed
+    if state["alerted_date"] is not None and state["alerted_date"] != today_str:
+        state["last_seen_update_time"] = None
+        state["last_error_alert_at"] = None
+        state["alerted_date"] = None
+
+    # Enforce schedule window for normal checks
+    if not forced:
+        if not (is_weekday(dt) and in_window(dt)):
+            return None
+        if state["alerted_date"] == today_str:
+            return None  # already alerted today
+
+    try:
+        payload = await fetch_payload()
+        data = payload.get("data", {})
+        update_time_str = data.get("update_time")
+
+        if not update_time_str:
+            raise ValueError(f"Missing data.update_time in response: {payload}")
+
+        # Detect change vs last seen
+        changed = (state["last_seen_update_time"] != update_time_str)
+
+        # Only alert if update_time is today's date (SGT)
+        ut = parse_update_time_sgt(update_time_str)
+        is_today_update = (ut.strftime("%Y-%m-%d") == today_str)
+
+        logging.info(
+            "Fetched update_time=%s changed=%s is_today_update=%s forced=%s",
+            update_time_str, changed, is_today_update, forced
+        )
+
+        # Always store last seen (in-memory)
+        state["last_seen_update_time"] = update_time_str
+
+        # Alert condition
+        if state["alerted_date"] != today_str and changed and is_today_update:
+            await send_alert(context, payload)
+            state["alerted_date"] = today_str
+            logging.info("Alert sent for %s. Stop checking for the day.", today_str)
+
+        return payload
+
+    except Exception as e:
+        logging.exception("Error while fetching/parsing.")
+        # Only alert errors during window, or when forced
+        if forced or (is_weekday(dt) and in_window(dt)):
+            if should_send_error_alert(dt):
+                await send_error(context, str(e))
+                state["last_error_alert_at"] = dt
         return None
-    try:
-        js = r.json()
-    except Exception:
-        return None
-    if r.status_code == 200 and js.get("ok"):
-        mid = js["result"]["message_id"]
-        await pin_message(mid)
-        return mid
-    return None
 
-async def answer_callback_query(callback_query_id: str, text: str = ""):
-    payload = {"callback_query_id": callback_query_id}
-    if text:
-        payload["text"] = text
-        payload["show_alert"] = False
-    await tg_post("answerCallbackQuery", payload, timeout=10)
-
-# ================= HOLIDAY HELPERS (SG + UAE only) =================
-
-def week_range_monday_to_sunday(d: date):
-    monday = d.fromordinal(d.toordinal() - d.weekday())
-    sunday = monday.fromordinal(monday.toordinal() + 6)
-    return monday, sunday
-
-def fmt_day(d: date) -> str:
-    return d.strftime("%a %d %b %Y")
-
-_holiday_cache = {}
-
-async def fetch_holidays_for_year(country_code: str, year: int) -> list[dict]:
-    key = (year, country_code)
-    if key in _holiday_cache:
-        return _holiday_cache[key]
-
-    url = f"{HOLIDAY_API_BASE}/{year}/{country_code}"
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get(url, timeout=20)
-        except Exception as e:
-            print(f"HOLIDAY GET EXCEPTION {country_code} {year}: {e}")
-            _holiday_cache[key] = []
-            return []
-
-    if r.status_code != 200:
-        print(f"HOLIDAY GET non-200 {country_code} {year}: {r.status_code}")
-        _holiday_cache[key] = []
-        return []
-
-    ctype = (r.headers.get("content-type") or "").lower()
-    if "json" not in ctype:
-        print(f"HOLIDAY GET non-json {country_code} {year}: {ctype}")
-        _holiday_cache[key] = []
-        return []
-
-    try:
-        data = r.json()
-        if not isinstance(data, list):
-            data = []
-    except json.JSONDecodeError:
-        data = []
-    except Exception:
-        data = []
-
-    _holiday_cache[key] = data
-    return data
-
-async def holiday_summary_for_this_week():
-    now = datetime.now(TZ)
-    monday, sunday = week_range_monday_to_sunday(now.date())
-    years_needed = {monday.year, sunday.year}
-
-    countries = [
-        ("Singapore", "SG"),
-        ("Dubai (UAE)", "AE"),
-    ]
-
-    lines = [f"📅 Public Holidays This Week ({fmt_day(monday)} → {fmt_day(sunday)})"]
-
-    for label, code in countries:
-        hits = []
-        for y in years_needed:
-            for h in await fetch_holidays_for_year(code, y):
-                try:
-                    hd = date.fromisoformat(h["date"])
-                except Exception:
-                    continue
-                if monday <= hd <= sunday:
-                    hits.append((hd, h.get("name") or h.get("localName") or "Holiday"))
-
-        hits.sort(key=lambda x: x[0])
-        if not hits:
-            lines.append(f"\n• {label}: None")
-        else:
-            lines.append(f"\n• {label}:")
-            for hd, name in hits:
-                lines.append(f"  - {hd:%a %d %b}: {name}")
-
-    return "\n".join(lines)
-
-# ================= UPDATE POLLING (for button clicks) =================
-
-_last_update_id = 0
-
-async def poll_updates_and_process(today_key: str, state: dict):
-    """
-    Uses getUpdates to capture inline-button clicks and mark TARGET_USERNAME as responded.
-    state contains:
-      - responded_today: bool
-      - response_value: str|None
-    """
-    global _last_update_id
-
-    r = await tg_get("getUpdates", {"offset": _last_update_id + 1, "timeout": 0}, timeout=10)
-    if not r:
-        return
-    try:
-        js = r.json()
-    except Exception:
-        return
-    if not js.get("ok"):
+# =========================
+# Telegram commands
+# =========================
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    payload = await check_logic(context, forced=True)
+    if payload is None:
+        await update.message.reply_text(
+            "⚠️ /status: Could not fetch payload (API down or invalid response). "
+            "If within window, an error alert will also be sent (with cooldown)."
+        )
         return
 
-    updates = js.get("result", [])
-    for upd in updates:
-        _last_update_id = max(_last_update_id, upd.get("update_id", _last_update_id))
+    await update.message.reply_text(build_status_message(payload), parse_mode=ParseMode.HTML)
 
-        cq = upd.get("callback_query")
-        if not cq:
-            continue
+async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    payload = await check_logic(context, forced=True)
+    if payload is None:
+        await update.message.reply_text("⚠️ /check: API fetch failed.")
+        return
 
-        cq_id = cq.get("id")
-        from_user = cq.get("from", {})
-        username = (from_user.get("username") or "").lower()
-        data = cq.get("data", "")
+    await update.message.reply_text(
+        f"<pre>{json.dumps(payload, ensure_ascii=False)}</pre>",
+        parse_mode=ParseMode.HTML
+    )
 
-        # Always acknowledge the button click to stop Telegram "loading..."
-        await answer_callback_query(cq_id, "Recorded ✅")
+# =========================
+# Scheduled job
+# =========================
+async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await check_logic(context, forced=False)
 
-        if username == TARGET_USERNAME.lower() and data in {"QCDT_YES", "QCDT_NO", "QCDT_NA"}:
-            state["responded_today"] = True
-            state["response_value"] = data
-            print(f"INFO: {TARGET_USERNAME} responded today with {data}")
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-# ================= SCHEDULER LOOP =================
+    # Commands
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("check", check_cmd))
 
-async def scheduler():
-    print("BOOT: scheduler() starting")
-    fired = set()
-    last_date = datetime.now(TZ).date()
+    # Repeat job every 30 minutes (logic enforces weekday + window + stop-after-alert)
+    # IMPORTANT: requires python-telegram-bot[job-queue]
+    if app.job_queue is None:
+        raise RuntimeError(
+            "JobQueue is not available. Install with: "
+            'pip install "python-telegram-bot[job-queue]"'
+        )
 
-    # per-day state
-    state = {"responded_today": False, "response_value": None}
+    app.job_queue.run_repeating(
+        scheduled_check,
+        interval=POLL_INTERVAL_SECONDS,
+        first=5  # start shortly after boot
+    )
 
-    await send_text(f"✅ QCDT bot online at {datetime.now(TZ):%a %d %b %Y %H:%M:%S} (SGT)")
-
-    while True:
-        now = datetime.now(TZ)
-
-        # Process button clicks (updates) every loop
-        await poll_updates_and_process(today_key=str(now.date()), state=state)
-
-        # Reset daily locks & per-day response state
-        if now.date() != last_date:
-            fired.clear()
-            last_date = now.date()
-            state["responded_today"] = False
-            state["response_value"] = None
-            print("INFO: new day -> reset fired + responded_today")
-
-        wd = now.weekday()  # Mon=0 ... Sun=6
-        h, m = now.hour, now.minute
-
-        # Mon–Fri 4:00 PM — holiday summary (SG + UAE)
-        if wd < 5 and h == 16 and m == 0 and "HOL_SUMMARY" not in fired:
-            fired.add("HOL_SUMMARY")
-            await send_text(await holiday_summary_for_this_week())
-
-        # Mon–Fri 5:30 PM — reminder
-        if wd < 5 and h == 17 and m == 30 and "DAILY_REMINDER" not in fired:
-            fired.add("DAILY_REMINDER")
-            await send_text(DAILY_REMINDER)
-
-        # Mon–Fri 5:45 PM — send check-in buttons + pin
-        if wd < 5 and h == 17 and m == 45 and "DAILY_CHECKIN" not in fired:
-            fired.add("DAILY_CHECKIN")
-            state["responded_today"] = False
-            state["response_value"] = None
-            await send_checkin_and_pin()
-
-        # Mon–Fri: if not responded, tag every 15 mins from 6:00 PM to 9:00 PM
-        if wd < 5 and "DAILY_CHECKIN" in fired and not state["responded_today"]:
-            start_ok = (h > NAG_START_HOUR) or (h == NAG_START_HOUR and m >= NAG_START_MIN)
-            end_ok = (h < NAG_END_HOUR) or (h == NAG_END_HOUR and m <= NAG_END_MIN)
-
-            if start_ok and end_ok and (m % NAG_EVERY_MINUTES == 0):
-                key = f"NAG_{h:02d}{m:02d}"
-                if key not in fired:
-                    fired.add(key)
-                    await send_text(f"{TARGET_MENTION} reminder: please respond to the QCDT update check-in above ✅")
-
-        await asyncio.sleep(15)
-
-# ================= ENTRY =================
+    logging.info("QCDT monitor bot started.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(scheduler())
+    main()
