@@ -13,24 +13,19 @@ TZ = ZoneInfo("Asia/Singapore")
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 DAILY_REMINDER = "📝 Ascent, please remember to update QCDT price on the portal."
-HOLIDAY_API_BASE = "https://date.nager.at/api/v3/PublicHolidays"
 
-# Acknowledgement settings
-TARGET_USERNAME = "mrpotato1234"  # without @
+# Who to nag until they click
+TARGET_USERNAME = "mrpotato1234"       # without @
 TARGET_MENTION = "@mrpotato1234"
 
-ACK_COMMANDS = {
-    "/qcdt_done": "DONE",
-    "/qcdt_no": "NO",
-    "/qcdt_na": "NA",
-}
-
-# Nag cadence (every 15 minutes)
+# Reminder cadence after check-in is posted
 NAG_EVERY_MINUTES = 15
-NAG_START_HOUR = 18  # 6:00 PM
+NAG_START_HOUR = 18      # 6:00 PM
 NAG_START_MIN = 0
-NAG_END_HOUR = 21    # 9:00 PM cutoff
+NAG_END_HOUR = 21        # 9:00 PM cutoff (adjust if you want)
 NAG_END_MIN = 0
+
+HOLIDAY_API_BASE = "https://date.nager.at/api/v3/PublicHolidays"
 
 # ================= TELEGRAM HELPERS =================
 
@@ -59,33 +54,48 @@ async def tg_get(method: str, params: dict, timeout: int = 20):
 async def send_text(text: str):
     await tg_post("sendMessage", {"chat_id": CHAT_ID, "text": text}, timeout=10)
 
-async def send_poll_and_pin(question: str, options: list[str]):
-    r = await tg_post(
-        "sendPoll",
-        {
-            "chat_id": CHAT_ID,
-            "question": question,
-            "options": options,
-            "is_anonymous": False,
-            "allows_multiple_answers": False,
-        },
-        timeout=20,
+async def pin_message(message_id: int):
+    await tg_post(
+        "pinChatMessage",
+        {"chat_id": CHAT_ID, "message_id": message_id, "disable_notification": True},
+        timeout=10,
     )
-    if not r:
-        return
 
+async def send_checkin_and_pin():
+    """
+    Sends a message with inline buttons (trackable per user), then pins it.
+    Returns message_id if successful else None.
+    """
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": "Has QCDT price been updated on portal?",
+        "reply_markup": {
+            "inline_keyboard": [
+                [{"text": "✅ Yes", "callback_data": "QCDT_YES"},
+                 {"text": "❌ No", "callback_data": "QCDT_NO"}],
+                [{"text": "🏖️ NA - SG/UAE public holiday", "callback_data": "QCDT_NA"}],
+            ]
+        }
+    }
+    r = await tg_post("sendMessage", payload, timeout=10)
+    if not r:
+        return None
     try:
         js = r.json()
     except Exception:
-        return
-
+        return None
     if r.status_code == 200 and js.get("ok"):
         mid = js["result"]["message_id"]
-        await tg_post(
-            "pinChatMessage",
-            {"chat_id": CHAT_ID, "message_id": mid, "disable_notification": True},
-            timeout=10,
-        )
+        await pin_message(mid)
+        return mid
+    return None
+
+async def answer_callback_query(callback_query_id: str, text: str = ""):
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+        payload["show_alert"] = False
+    await tg_post("answerCallbackQuery", payload, timeout=10)
 
 # ================= HOLIDAY HELPERS (SG + UAE only) =================
 
@@ -169,34 +179,26 @@ async def holiday_summary_for_this_week():
 
     return "\n".join(lines)
 
-# ================= ACK TRACKING VIA getUpdates =================
+# ================= UPDATE POLLING (for button clicks) =================
 
 _last_update_id = 0
 
-async def process_ack_updates(state: dict):
+async def poll_updates_and_process(today_key: str, state: dict):
     """
-    Reads group messages via getUpdates and marks state['ack_today']=True
-    if TARGET_USERNAME sends /qcdt_done, /qcdt_no, or /qcdt_na.
+    Uses getUpdates to capture inline-button clicks and mark TARGET_USERNAME as responded.
+    state contains:
+      - responded_today: bool
+      - response_value: str|None
     """
     global _last_update_id
 
-    # Only request message updates (avoid other update types)
-    params = {
-        "offset": _last_update_id + 1,
-        "limit": 50,
-        "timeout": 0,
-        "allowed_updates": json.dumps(["message"]),
-    }
-
-    r = await tg_get("getUpdates", params=params, timeout=10)
+    r = await tg_get("getUpdates", {"offset": _last_update_id + 1, "timeout": 0}, timeout=10)
     if not r:
         return
-
     try:
         js = r.json()
     except Exception:
         return
-
     if not js.get("ok"):
         return
 
@@ -204,25 +206,22 @@ async def process_ack_updates(state: dict):
     for upd in updates:
         _last_update_id = max(_last_update_id, upd.get("update_id", _last_update_id))
 
-        msg = upd.get("message")
-        if not msg:
+        cq = upd.get("callback_query")
+        if not cq:
             continue
 
-        chat = msg.get("chat", {})
-        if chat.get("id") != CHAT_ID:
-            continue  # ignore other chats
-
-        from_user = msg.get("from", {})
+        cq_id = cq.get("id")
+        from_user = cq.get("from", {})
         username = (from_user.get("username") or "").lower()
-        text = (msg.get("text") or "").strip()
+        data = cq.get("data", "")
 
-        if username == TARGET_USERNAME.lower():
-            cmd = text.split()[0].lower() if text else ""
-            if cmd in ACK_COMMANDS:
-                state["ack_today"] = True
-                state["ack_value"] = ACK_COMMANDS[cmd]
-                print(f"ACK: {TARGET_USERNAME} -> {state['ack_value']}")
-                await send_text(f"✅ Acknowledged by {TARGET_MENTION}: {state['ack_value']}")
+        # Always acknowledge the button click to stop Telegram "loading..."
+        await answer_callback_query(cq_id, "Recorded ✅")
+
+        if username == TARGET_USERNAME.lower() and data in {"QCDT_YES", "QCDT_NO", "QCDT_NA"}:
+            state["responded_today"] = True
+            state["response_value"] = data
+            print(f"INFO: {TARGET_USERNAME} responded today with {data}")
 
 # ================= SCHEDULER LOOP =================
 
@@ -232,28 +231,28 @@ async def scheduler():
     last_date = datetime.now(TZ).date()
 
     # per-day state
-    state = {"ack_today": False, "ack_value": None}
+    state = {"responded_today": False, "response_value": None}
 
     await send_text(f"✅ QCDT bot online at {datetime.now(TZ):%a %d %b %Y %H:%M:%S} (SGT)")
 
     while True:
         now = datetime.now(TZ)
 
-        # Read acknowledgements continuously
-        await process_ack_updates(state)
+        # Process button clicks (updates) every loop
+        await poll_updates_and_process(today_key=str(now.date()), state=state)
 
-        # Reset daily locks & ack state
+        # Reset daily locks & per-day response state
         if now.date() != last_date:
             fired.clear()
             last_date = now.date()
-            state["ack_today"] = False
-            state["ack_value"] = None
-            print("INFO: new day -> reset fired + ack")
+            state["responded_today"] = False
+            state["response_value"] = None
+            print("INFO: new day -> reset fired + responded_today")
 
         wd = now.weekday()  # Mon=0 ... Sun=6
         h, m = now.hour, now.minute
 
-        # Mon–Fri 4:00 PM — holiday summary
+        # Mon–Fri 4:00 PM — holiday summary (SG + UAE)
         if wd < 5 and h == 16 and m == 0 and "HOL_SUMMARY" not in fired:
             fired.add("HOL_SUMMARY")
             await send_text(await holiday_summary_for_this_week())
@@ -263,22 +262,15 @@ async def scheduler():
             fired.add("DAILY_REMINDER")
             await send_text(DAILY_REMINDER)
 
-        # Mon–Fri 5:45 PM — poll (sent + pinned)
-        if wd < 5 and h == 17 and m == 45 and "DAILY_POLL" not in fired:
-            fired.add("DAILY_POLL")
-            state["ack_today"] = False
-            state["ack_value"] = None
-            await send_poll_and_pin(
-                "Has QCDT price been updated on portal?",
-                ["Yes", "No", "NA - SG/UAE public holiday"],
-            )
-            await send_text(
-                f"{TARGET_MENTION} please acknowledge with one of: "
-                f"/qcdt_done /qcdt_no /qcdt_na"
-            )
+        # Mon–Fri 5:45 PM — send check-in buttons + pin
+        if wd < 5 and h == 17 and m == 45 and "DAILY_CHECKIN" not in fired:
+            fired.add("DAILY_CHECKIN")
+            state["responded_today"] = False
+            state["response_value"] = None
+            await send_checkin_and_pin()
 
-        # Mon–Fri: if not acked, tag every 15 mins (6:00–9:00 PM)
-        if wd < 5 and "DAILY_POLL" in fired and not state["ack_today"]:
+        # Mon–Fri: if not responded, tag every 15 mins from 6:00 PM to 9:00 PM
+        if wd < 5 and "DAILY_CHECKIN" in fired and not state["responded_today"]:
             start_ok = (h > NAG_START_HOUR) or (h == NAG_START_HOUR and m >= NAG_START_MIN)
             end_ok = (h < NAG_END_HOUR) or (h == NAG_END_HOUR and m <= NAG_END_MIN)
 
@@ -286,10 +278,7 @@ async def scheduler():
                 key = f"NAG_{h:02d}{m:02d}"
                 if key not in fired:
                     fired.add(key)
-                    await send_text(
-                        f"{TARGET_MENTION} reminder: please acknowledge "
-                        f"/qcdt_done /qcdt_no /qcdt_na"
-                    )
+                    await send_text(f"{TARGET_MENTION} reminder: please respond to the QCDT update check-in above ✅")
 
         await asyncio.sleep(15)
 
