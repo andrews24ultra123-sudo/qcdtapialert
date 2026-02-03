@@ -14,24 +14,25 @@ from telegram.ext import (
     PollAnswerHandler,
     CommandHandler,
 )
+from telegram.error import Forbidden
 
 # =========================
-# CONFIG
+# CONFIG (YOUR VALUES)
 # =========================
-BOT_TOKEN = "8591711650:AAHYMbGwiYxCqZm64tKyWiOgl2moiRUvVWM"
-CHAT_ID = -4680966417
+BOT_TOKEN = "8183120153:AAF3k3FZViX33glskyf-CTi2F3LoxulGvV0"
+CHAT_ID = -5299275232
 API_URL = "https://www.dmz.finance/stores/tdd/qcdt/new_price"
 
 TZ = ZoneInfo("Asia/Singapore")
 
-# Times (SGT)
+# Schedule (SGT, weekdays)
 HOLIDAY_TIME = dtime(16, 0)      # 4:00pm
 REMINDER_TIME = dtime(17, 30)    # 5:30pm
 NAG_START = dtime(18, 0)         # 6:00pm
 NAG_END = dtime(21, 0)           # 9:00pm
 
-CHECK_EVERY_MIN = 2
-NAG_EVERY_MIN = 15
+CHECK_EVERY_MIN = 2              # price polling
+NAG_EVERY_MIN = 15               # nag cadence
 
 TAG_LINE = "@mrpotato1234 please cross ref QCDT price to NAV pack email"
 CC_LINE = "CC: @Nathan_DMZ @LEEKAIYANG @Duke_RWAlpha @AscentHamza @Ascentkaiwei"
@@ -40,10 +41,10 @@ DAILY_REMINDER = "📝 Ascent, please remember to update QCDT price on the porta
 
 HOLIDAY_API = "https://date.nager.at/api/v3/PublicHolidays"
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # =========================
-# STATE (daily)
+# STATE (IN-MEMORY, DAILY)
 # =========================
 state = {
     "last_seen_update_time": None,
@@ -59,7 +60,7 @@ state = {
 ERROR_COOLDOWN = timedelta(minutes=60)
 
 # =========================
-# HELPERS
+# TIME HELPERS
 # =========================
 def now_sgt():
     return datetime.now(TZ)
@@ -70,14 +71,17 @@ def today_str():
 def is_weekday():
     return now_sgt().weekday() < 5
 
-def pretty(d: str):
-    return datetime.strptime(d, "%Y-%m-%d").strftime("%d %b %Y").lstrip("0")
+def pretty_date(s):
+    return datetime.strptime(s, "%Y-%m-%d").strftime("%d %b %Y").lstrip("0")
 
-def should_error():
+def pretty_today():
+    return now_sgt().strftime("%d %b %Y").lstrip("0")
+
+def should_send_error():
     return state["last_error_at"] is None or now_sgt() - state["last_error_at"] > ERROR_COOLDOWN
 
 # =========================
-# HOLIDAYS (simple & safe)
+# HOLIDAYS (SAFE)
 # =========================
 async def holiday_summary():
     today = now_sgt().date()
@@ -121,13 +125,15 @@ def parse_update_time(s):
     return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
 
 # =========================
-# TELEGRAM
+# TELEGRAM HELPERS
 # =========================
-async def send(ctx, text, mode=None):
-    await ctx.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=mode)
-
-async def send_error(ctx, e):
-    await send(ctx, f"⚠️ Error:\n<pre>{e}</pre>", ParseMode.HTML)
+async def safe_send(ctx, text, mode=None):
+    try:
+        await ctx.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=mode)
+    except Forbidden:
+        logging.error("Forbidden: bot not in group or no permission.")
+    except Exception as e:
+        logging.error("Send failed: %s", e)
 
 # =========================
 # PRICE CHECK
@@ -140,16 +146,16 @@ async def check_price(ctx):
         payload = await fetch_payload()
         ut = payload["data"]["update_time"]
         changed = ut != state["last_seen_update_time"]
-        today_update = parse_update_time(ut).strftime("%Y-%m-%d") == today_str()
+        is_today = parse_update_time(ut).strftime("%Y-%m-%d") == today_str()
 
         state["last_seen_update_time"] = ut
 
-        if changed and today_update:
+        if changed and is_today:
             state["update_detected"] = True
             state["pending_update_payload"] = payload
 
-            await send(ctx, f"<pre>{json.dumps(payload)}</pre>", ParseMode.HTML)
-            await send(ctx, TAG_LINE)
+            await safe_send(ctx, f"<pre>{json.dumps(payload)}</pre>", ParseMode.HTML)
+            await safe_send(ctx, TAG_LINE)
 
             poll = await ctx.bot.send_poll(
                 CHAT_ID,
@@ -160,15 +166,21 @@ async def check_price(ctx):
             state["pending_update_poll_id"] = poll.poll.id
 
     except Exception as e:
-        if should_error():
+        if should_send_error():
             state["last_error_at"] = now_sgt()
-            await send_error(ctx, e)
+            await safe_send(ctx, f"⚠️ Error:\n<pre>{e}</pre>", ParseMode.HTML)
 
 # =========================
 # NAG POLL
 # =========================
 async def nag_poll(ctx):
     if state["stop_all"] or state["stop_nags"] or state["update_detected"]:
+        return
+    if not is_weekday():
+        return
+
+    now = now_sgt().time()
+    if not (NAG_START <= now <= NAG_END):
         return
 
     poll = await ctx.bot.send_poll(
@@ -189,26 +201,28 @@ async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     choice = pa.option_ids[0]
 
+    # Update-detected poll
     if pa.poll_id == state["pending_update_poll_id"]:
         state["stop_all"] = True
         payload = state["pending_update_payload"]
 
         if choice == 0:
             d = payload["data"]
-            await send(
+            await safe_send(
                 ctx,
-                f"Updated today on {pretty(today_str())} for {pretty(d['price_date'])} QCDT price. "
+                f"Updated today on {pretty_today()} for {pretty_date(d['price_date'])} QCDT price. "
                 f"Price of {d['price']} tallies with NAV report. {CC_LINE}",
             )
         elif choice == 1:
-            await send(ctx, "🕵️ Marked as Investigating / Dispute.")
+            await safe_send(ctx, "🕵️ Marked as Investigating / Dispute.")
         else:
-            await send(ctx, "🎌 Marked as Public holiday.")
+            await safe_send(ctx, "🎌 Marked as Public holiday.")
 
+    # Nag poll
     elif pa.poll_id == state["pending_nag_poll_id"]:
         if choice == 1:
             state["stop_nags"] = True
-            await send(ctx, "🎌 Public holiday noted. Nag reminders stopped.")
+            await safe_send(ctx, "🎌 Public holiday noted. Nag reminders stopped.")
 
 # =========================
 # DAILY RESET
@@ -217,33 +231,38 @@ async def daily_reset(ctx):
     for k in state:
         state[k] = False if isinstance(state[k], bool) else None
     state["last_seen_update_time"] = None
-    await send(ctx, "🔄 QCDT bot daily reset.")
+    await safe_send(ctx, "🔄 QCDT bot daily reset (SGT).")
 
 # =========================
 # STARTUP
 # =========================
 async def post_init(app):
-    await app.bot.send_message(
-        CHAT_ID,
-        f"✅ QCDT bot online at {now_sgt():%a %d %b %H:%M} SGT",
-    )
+    try:
+        await app.bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"✅ QCDT bot online at {now_sgt():%a %d %b %H:%M} SGT",
+        )
+    except Forbidden:
+        logging.error("Startup message blocked (Forbidden).")
+    except Exception as e:
+        logging.error("Startup message failed: %s", e)
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(PollAnswerHandler(on_poll_answer))
-    app.add_handler(CommandHandler("status", lambda u, c: send(c, "Bot alive ✅")))
+    app.add_handler(CommandHandler("status", lambda u, c: safe_send(c, "Bot alive ✅")))
 
     jq = app.job_queue
 
     jq.run_repeating(check_price, interval=CHECK_EVERY_MIN * 60, first=10)
     jq.run_repeating(nag_poll, interval=NAG_EVERY_MIN * 60, first=60)
 
-    jq.run_daily(lambda c: send(c, asyncio.run(holiday_summary())), time=HOLIDAY_TIME)
-    jq.run_daily(lambda c: send(c, DAILY_REMINDER), time=REMINDER_TIME)
+    jq.run_daily(lambda c: safe_send(c, asyncio.run(holiday_summary())), time=HOLIDAY_TIME)
+    jq.run_daily(lambda c: safe_send(c, DAILY_REMINDER), time=REMINDER_TIME)
     jq.run_daily(daily_reset, time=dtime(0, 1))
 
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
