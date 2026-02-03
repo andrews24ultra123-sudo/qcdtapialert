@@ -20,13 +20,13 @@ from telegram.error import Forbidden
 # CONFIG (YOUR VALUES)
 # =========================
 BOT_TOKEN = "8183120153:AAF3k3FZViX33glskyf-CTi2F3LoxulGvV0"
-CHAT_ID = -5299275232
+CHAT_ID = -4680966417
 API_URL = "https://www.dmz.finance/stores/tdd/qcdt/new_price"
 
 TZ = ZoneInfo("Asia/Singapore")
 
 # Schedule (SGT, weekdays)
-HOLIDAY_TIME = dtime(16, 0)      # 4:00pm
+HOLIDAY_TIME = dtime(16, 30)      # 4:30pm
 REMINDER_TIME = dtime(17, 30)    # 5:30pm
 NAG_START = dtime(18, 0)         # 6:00pm
 NAG_END = dtime(21, 0)           # 9:00pm
